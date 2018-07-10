@@ -5,18 +5,19 @@
 #include <stdio.h>
 #include <string.h>
 
+#define BUFFER_LEN 4096
+
 struct CommPort
 {
 	HANDLE hFile;
 	Event* cancel;
-	char port[8];
-	CommSettings settings;
+	CommInfo info;
 };
 
 CommPort* CommPort_create(const char* port)
 {
 	CommSettings settings;
-	settings.baund = 4800;
+	settings.baund = 9600;
 	settings.data = 8;
 	settings.stop = StopBits_One;
 	settings.parity = Parity_None;
@@ -32,16 +33,24 @@ CommPort* CommPort_createEx(const char* port, const CommSettings* settings)
 	HANDLE hFile = CreateFile(file, GENERIC_READ | GENERIC_WRITE, 0, NULL,
 							  OPEN_EXISTING, FILE_FLAG_OVERLAPPED, 0);
 	if(hFile == INVALID_HANDLE_VALUE)
-		return NULL;
-	if(!SetCommMask(hFile, EV_RXCHAR | EV_ERR))
 	{
-		CloseHandle(hFile);
+#ifdef DEBUGLIB
+		printf("Failed to open port \"%s\"\n", port);
+#endif
 		return NULL;
 	}
+	/*if(!SetCommMask(hFile, EV_RXCHAR | EV_ERR))
+	{
+		CloseHandle(hFile);
+#ifdef DEBUGLIB
+		printf("Failed set comm mask\n");
+#endif
+		return NULL;
+	}*/
 	CommPort* comm = (CommPort*)malloc(sizeof(CommPort));
 	comm->hFile = hFile;
 	comm->cancel = Event_createEx(FALSE, FALSE);
-	strcpy(comm->port, port);
+	strcpy(comm->info.port, port);
 	CommPort_configure(comm, settings);
 	return comm;
 }
@@ -54,7 +63,12 @@ int CommPort_configure(CommPort* comm, const CommSettings* settings)
 	memset(&dcb, 0, sizeof(DCB));
 	dcb.DCBlength = sizeof(DCB);
 	if(!GetCommState(comm->hFile, &dcb))
+	{
+#ifdef DEBUGLIB
+		printf("Failed to get comm state\n");
+#endif
 		return 0;
+	}
 	/*
 	 * Boilerplate.
 	 */
@@ -78,29 +92,46 @@ int CommPort_configure(CommPort* comm, const CommSettings* settings)
 	if(settings->flow == Flow_XONXOFF)
 	    dcb.fOutX = dcb.fInX = TRUE;
 	else if(settings->flow == Flow_RTSCTS)
-	{	    dcb.fRtsControl = RTS_CONTROL_HANDSHAKE;
-	    dcb.fOutxCtsFlow = TRUE;	}
+	{
+	    dcb.fRtsControl = RTS_CONTROL_HANDSHAKE;
+	    dcb.fOutxCtsFlow = TRUE;
+	}
 	else if(settings->flow == Flow_DSRDTR)
 	{
 	    dcb.fDtrControl = DTR_CONTROL_HANDSHAKE;
 	    dcb.fOutxDsrFlow = TRUE;
 	}
 	if(!SetCommState(comm->hFile, &dcb))
+	{
+#ifdef DEBUGLIB
+		printf("Failed to set comm state\n");
+#endif
 		return 0;
+	}	
 	if (!GetCommTimeouts(comm->hFile, &timeouts))
-	    return 0;
+	{
+#ifdef DEBUGLIB
+		printf("Failed to get comm timeouts\n");
+#endif
+		return 0;
+	}	
 	timeouts.ReadIntervalTimeout = 1;
 	timeouts.ReadTotalTimeoutMultiplier = 0;
 	timeouts.ReadTotalTimeoutConstant = 0;
 	timeouts.WriteTotalTimeoutMultiplier = 0;
 	timeouts.WriteTotalTimeoutConstant = 0;
 	if (!SetCommTimeouts(comm->hFile, &timeouts))
-	    return 0;
-	comm->settings.baund = settings->baund;
-	comm->settings.data = settings->data;
-	comm->settings.stop = settings->stop;
-	comm->settings.parity = settings->parity;
-	comm->settings.flow = settings->flow;
+	{
+#ifdef DEBUGLIB
+		printf("Failed to set comm timeouts\n");
+#endif
+		return 0;
+	}
+	comm->info.settings.baund = settings->baund;
+	comm->info.settings.data = settings->data;
+	comm->info.settings.stop = settings->stop;
+	comm->info.settings.parity = settings->parity;
+	comm->info.settings.flow = settings->flow;
 	return 1;
 }
 
@@ -112,17 +143,24 @@ int CommPort_enum(char * buffer, int size)
 	BYTE * PortsPtr;
 	PPORT_INFO_1 InfoPtr;
 	char * TempStr, * ptr, *search;
-	Success = EnumPorts(NULL, 1, NULL, 0, &BytesNeeded, &Returned);
-	if(Success || GetLastError() != ERROR_INSUFFICIENT_BUFFER)
-		return 0;
-	PortsPtr = (BYTE*)malloc(BytesNeeded);
-	Success = EnumPorts(NULL, 1, PortsPtr, BytesNeeded, &BytesNeeded, &Returned);
-	if(!Success)
-		return 0;
-	if(buffer == NULL || size < (int)(BytesNeeded + Returned + 1))
+	
+	PortsPtr = (BYTE*)malloc(size);
+	Success = EnumPorts(NULL, 1, PortsPtr, size, &BytesNeeded, &Returned);
+	if(!Success && GetLastError() == ERROR_INSUFFICIENT_BUFFER)
 	{
+#ifdef DEBUGLIB
+		printf("Insufficient buffer, need %li byte\n", BytesNeeded);
+#endif
 		free(PortsPtr);
-		return (BytesNeeded + Returned + 1) - size;
+		return -BytesNeeded;
+	}
+	if(!Success)
+	{
+#ifdef DEBUGLIB
+		printf("Failed to enum ports\n");
+#endif
+		free(PortsPtr);
+		return 0;
 	}
 	ptr = buffer;
 	ptr[0] = 0;
@@ -207,35 +245,32 @@ int _CommPort_check(CommPort* comm, Event * evReceive, OVERLAPPED * ovl,
 	
 	events[0] = comm->cancel;
 	events[1] = evReceive;
-	if(!success)
+	if(success)
+		return 1;
+	if(GetLastError() != ERROR_IO_PENDING)
 	{
-		if(GetLastError() != ERROR_IO_PENDING)
-		{
 #ifdef DEBUGLIB
-			Error("_CommPort_check[WaitCommEvent]");
+		Error("_CommPort_check[WriteFile||ReadFile||WaitCommEvent]");
 #endif
-			return 0;
-		}
-		signaled = Event_waitMultipleEx(events, 2, milliseconds);
-		if(signaled != evReceive)
-		{
-#ifdef DEBUGLIB
-			Error("_CommPort_check[Event_waitMultipleEx]");
-			if(signaled == NULL)
-			{
-				printf("Time limit exceded\n");
-			}
-			else
-				printf("Action canceled\n");
-#endif
-			// cancel write operation to local variable mask
-			CancelIo(comm->hFile);
-			return 0;
-		}
+		return 0;
 	}
-	else
+	signaled = Event_waitMultipleEx(events, 2, milliseconds);
+	if(signaled != evReceive)
 	{
-		Event_post(evReceive);
+#ifdef DEBUGLIB
+		Error("_CommPort_check[Event_waitMultipleEx]");
+		if(signaled == NULL)
+		{
+			printf("Tempo limite excedido\n");
+		}
+		else
+			printf("Acao cancelada\n");
+#endif
+		// cancel write operation to local variable
+		CancelIo(comm->hFile);
+		if(signaled == comm->cancel)
+			Event_wait(evReceive); // wait for release local variable
+		return 0;
 	}
 	if(!GetOverlappedResult(comm->hFile, ovl, bytesTrans, FALSE))
 	{
@@ -260,8 +295,14 @@ int CommPort_writeEx(CommPort* comm, const unsigned char* bytes, int count,
 	BOOL success = WriteFile(comm->hFile, (LPCVOID)bytes, count, &bytesTrans, &ovl);
 	success = _CommPort_check(comm, evReceive, &ovl, success, &bytesTrans, milliseconds);
 	Event_free(evReceive);
-	if(!success)
+	if(!success || bytesTrans != (DWORD)count)	
+	{
+#ifdef DEBUGLIB
+		if(success)
+			printf("Error: Write only %d of %d bytes\n", (int)bytesTrans, count);
+#endif	
 		return 0;
+	}
 	return bytesTrans;
 }
 
@@ -306,8 +347,14 @@ int CommPort_readEx(CommPort* comm, unsigned char* bytes, int count, int millise
 	BOOL success = ReadFile(comm->hFile, (PVOID)bytes, count, NULL, &ovl);
 	success = _CommPort_check(comm, evReceive, &ovl, success, &bytesTrans, milliseconds);
 	Event_free(evReceive);
-	if(!success)
+	if(!success || bytesTrans == (DWORD)-1)
 		return 0;
+#ifdef DEBUGLIB
+	if(bytesTrans > count) {
+		printf("CommPort_readEx[ReadCountError]: Trying to read %d bytes, but %li read instead\n", 
+			count, bytesTrans);
+	}
+#endif
 	return bytesTrans;
 }
 
@@ -319,10 +366,6 @@ void CommPort_cancel(CommPort* comm)
 void CommPort_free(CommPort* comm)
 {
 	CommPort_cancel(comm);
-	Thread_wait(0);
-	PurgeComm(comm->hFile, PURGE_TXABORT | PURGE_RXABORT);
-	SetCommMask(comm->hFile, 0);
-	PurgeComm(comm->hFile, PURGE_TXCLEAR | PURGE_RXCLEAR);
 	Event_free(comm->cancel);
 	CloseHandle(comm->hFile);
 	free(comm);

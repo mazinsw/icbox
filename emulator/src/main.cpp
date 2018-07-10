@@ -21,7 +21,6 @@ typedef struct _IcBox
 	Event* deviceEvent;
 	Event* deviceReady;
 	CommPort* commPort;
-	int callerID; // enable caller id
 	// random ring
 	Thread* ringThread;
 	Event* ringEvent;
@@ -33,7 +32,6 @@ typedef struct _IcBox
 	Thread* listenThread;
 	int done;
 	char number[20];
-	char name[100];
 } IcBox;
 
 // include VSPE API header and library
@@ -127,11 +125,6 @@ void sendString(IcBox *icBox, const char * str)
 	CommPort_write(icBox->commPort, (unsigned char*)str, strlen(str));
 }
 
-void sendOK(IcBox *icBox) 
-{
-	sendString(icBox, "\r\nOK\r\n");
-}
-
 void randomRing(void* data)
 {
 	IcBox* icBox = (IcBox*)data;
@@ -149,26 +142,15 @@ void randomRing(void* data)
 			break;
 		printf("Ringing...\n");
 		icBox->ringState = rsRing;
-		sendString(icBox, "\r\nRING\r\n");
-		if(icBox->callerID)
-		{
-			sendString(icBox, "\r\nDATE = 0720\r\n");
-			sendString(icBox, "TIME = 2351\r\n");
-			strcpy(cmd, "NAME = ");
-			strcat(cmd, icBox->name);
-			strcat(cmd, "\r\n");
-			sendString(icBox, cmd);
-			strcpy(cmd, "NMBR = ");
-			strcat(cmd, icBox->number);
-			strcat(cmd, "\r\n");
-			sendString(icBox, cmd);
-		}
+        strcpy(cmd, "          ");
+        strcat(cmd, icBox->number);
+        strcat(cmd, "E001000000000000I000000\r\n");
+        sendString(icBox, cmd);
 		Thread_wait(5000);
 		int i;
 		for(i = 0; i < 5; i++)
 		{
 			if(icBox->ringState == rsRing) {
-				sendString(icBox, "\r\nRING\r\n");
 				Thread_wait(5000);
 			} else 
 				break;
@@ -184,7 +166,6 @@ void randomRing(void* data)
 		} else {			
 			icBox->ringState = rsNoCarrier;
 		}
-		sendString(icBox, "\r\nNO CARRIER\r\n");
 	}
 }
 
@@ -211,94 +192,26 @@ void freeRandomRing(IcBox *icBox)
 void proccessCommand(IcBox *icBox, const char * cmd) 
 {
 	printf("%s\n", cmd);
-	if(stricmp(cmd, "AT") == 0 || stricmp(cmd, "ATZ") == 0)
-		sendOK(icBox);
-	else if(stricmp(cmd, "AT+VCID=1") == 0 || stricmp(cmd, "AT#CID=1") == 0 ||
-		    stricmp(cmd, "AT#CC1") == 0 || stricmp(cmd, "AT%CCID=1") == 0 || 
-			stricmp(cmd, "AT*ID1") == 0)
-	{
-		icBox->callerID = 1;
-		printf("Caller ID enabled\n");
-		sendOK(icBox);
-	}
-	else if(stricmp(cmd, "AT+VCID=0") == 0 || stricmp(cmd, "AT#CID=0") == 0 ||
-		    stricmp(cmd, "AT#CC0") == 0 || stricmp(cmd, "AT%CCID=0") == 0 || 
-			stricmp(cmd, "AT*ID0") == 0)
-	{
-		icBox->callerID = 0;
-		printf("Caller ID disabled\n");
-		sendOK(icBox);
-	}
-	else if(stricmp(cmd, "ATA") == 0 || stricmp(cmd, "ATH1") == 0)
-	{
-		if(icBox->ringState == rsRing) 
-		{
-			printf("Ready to connect\n");
-			icBox->ringState = rsAnswer;
-			sendOK(icBox);			
-		} else {
-			printf("Error not ringing\n");
-			sendString(icBox, "\r\nERROR\r\n");
-		}
-	}
-	else if(stricmp(cmd, "ATH0") == 0)
-	{
-		if(icBox->ringState == rsRing || icBox->ringState == rsAnswer) 
-		{
-			printf("Hang up\n");
-			icBox->ringState = rsHangUp;
-			sendOK(icBox);
-			if(icBox->onHook != NULL)
-				Event_post(icBox->onHook);
-		} else {
-			printf("Error not on-hook\n");
-			sendString(icBox, "\r\nERROR\r\n");
-		}
-	}
+	if(stricmp(cmd, "@CX\r\n") == 0)
+    {
+        sendString(icBox, "F\r\n");
+    }
 }
 
 void listenCommands(void* data)
 {
 	IcBox* icBox = (IcBox*)data;
 	char buffer[256];
-	int pos = 0, prev_pos, i;
-	int bytesAvailable, bytesRead, bytesToRead;
+	int bytesRead, bytesToRead;
 	
 	while(!icBox->done)
 	{
-		bytesAvailable = 0;
-		if(!CommPort_wait(icBox->commPort, &bytesAvailable))
-			break;
-		while(bytesAvailable > 0)
-		{
-			bytesToRead = bytesAvailable < (255 - pos)? bytesAvailable: (255 - pos);
-			bytesRead = CommPort_read(icBox->commPort, (unsigned char*)buffer + pos, bytesToRead);
-			if(!bytesRead)
-				break;
-			bytesAvailable -= bytesRead;
-			prev_pos = pos;
-			pos += bytesRead;
-			buffer[pos] = '\0';
-			// find carriage return
-			i = prev_pos;
-			while(i < pos)
-			{
-				if(buffer[i] == 13 || buffer[i] == 10) {
-					buffer[i] = '\0';
-					proccessCommand(icBox, buffer);
-					if(buffer[i] == 10)
-						i++; // skip LF
-					i++; // skip CR
-					// copy remaining command and find again
-					memcpy(buffer, buffer + i, pos - i);
-					pos = pos - i;
-					buffer[pos] = '\0';
-					i = 0;
-					continue;
-				}
-				i++;
-			}
-		}
+        bytesToRead = 256;
+        bytesRead = CommPort_read(icBox->commPort, (unsigned char*)buffer, bytesToRead);
+        if(!bytesRead)
+            continue;
+        buffer[bytesRead] = '\0';
+        proccessCommand(icBox, buffer);
 	}
 }
 
@@ -335,7 +248,6 @@ int main(int argc, char** argv)
 {
 	IcBox icBox;
 	memset(&icBox, 0, sizeof(IcBox));
-	strcpy(icBox.name, "MZSW CREATIVE SOFTWARE");
 	strcpy(icBox.number, "086987654321");
 	icBox.deviceEvent = Event_create();
 	icBox.deviceReady = Event_create();

@@ -25,7 +25,7 @@
 	<ConfigurationName Value="Default"/>
 	<Libs Value="-lVSPE_API -Llib -lwinspool -m32"/>
 	<Flags Value="-Iinclude -I..\src\system -I..\src\comm -m32"/>
-	<Target Value="IcBoxEmulator.exe"/>
+	<Target Value="bin/IcBoxEmulator.exe"/>
 	<CommandLine Value=""/>
 	<CompilerOptions Value="-Wall -s -O2"/>
 	<DeleteObjectsBefore Value="Yes"/>

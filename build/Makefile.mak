@@ -11,20 +11,20 @@ OBJS   = ../src/IcBox.o \
          ../src/util/Queue.o \
          AppResource.res
 
-LIBS   = -lwinspool -m64
-CFLAGS = -I..\include -I..\src\system -I..\src\comm -I..\src\util -DDEBUGLIB -m64 -fno-diagnostics-show-option
+LIBS   = -shared -Wl,--kill-at,--out-implib,../bin/x86/libIcBox.dll.a -lwinspool -m32
+CFLAGS = -I..\include -I..\src\system -I..\src\comm -I..\src\util -DBUILD_DLL -m32 -fno-diagnostics-show-option
 
 .PHONY: all
 
-all: ../bin/x64/IcBoxTest.exe
+all: ../bin/x86/IcBox.dll
 
 clean:
-	$(RM) $(OBJS) ../bin/x64/IcBoxTest.exe
+	$(RM) $(OBJS) ../bin/x86/IcBox.dll
 
 clear:
 	$(RM) $(OBJS)
 
-../bin/x64/IcBoxTest.exe: $(OBJS)
+../bin/x86/IcBox.dll: $(OBJS)
 	$(CC) -Wall -s -O2 -o $@ $(OBJS) $(LIBS)
 
 ../src/IcBox.o: ../src/IcBox.c ../src/system/Thread.h ../src/system/Mutex.h ../src/system/Event.h ../src/comm/CommPort.h ../src/util/StringBuilder.h ../src/util/Queue.h ../src/system/Mutex.h
@@ -52,5 +52,5 @@ clear:
 	$(CC) -Wall -s -O2 -c $< -o $@ $(CFLAGS)
 
 AppResource.res: AppResource.rc
-	$(WINDRES) -i AppResource.rc -J rc -o AppResource.res -O coff
+	$(WINDRES) -i AppResource.rc -J rc -o AppResource.res -O coff -F pe-i386
 

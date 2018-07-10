@@ -55,7 +55,7 @@ Event* Event_waitMultipleEx(Event** events, int count, int milliseconds)
 		handles[i] = (HANDLE*)Event_getHandle(events[i]);
 	signaled = WaitForMultipleObjects(count, handles, FALSE, milliseconds);
 	free(handles);
-	if(signaled >= (DWORD)WAIT_OBJECT_0 && (DWORD)signaled <= WAIT_OBJECT_0 + count)
+	if(signaled >= WAIT_OBJECT_0 && (int)signaled <= WAIT_OBJECT_0 + count)
 		return events[signaled - WAIT_OBJECT_0];
 	return NULL;
 }

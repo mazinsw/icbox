@@ -14,19 +14,27 @@
 #define BUFFER_SIZE 256
 
 static const char gVersion[] = "1.0.0.0";
+static const int REPEAT_BAUND = 19200;
+static const int baundValues[] = {9600, 2400, 4800, 19200, 14400, 38400, 57600, 115200, 230400, 460800, 921600, 110, 300, 600, 1200};
 
 struct IcBox
 {
 	int canceled;
+	int connected;
+	int abandoned;
+	int testing;
 	Thread* thConnect;
 	Thread* thReceive;
+	Thread* thAlive;
 	Event* evCancel;
+	Event* evDetected;
 	Event* evReceive;
 	CommPort * comm;
 	int connectTimeout;
 	int retryTimeout;
 	int requestAliveInterval;
 	char port[8];
+	int baundIndex;
 	CommSettings commSettings;
 	StringBuilder* config;
 	Mutex* mutex;
@@ -34,10 +42,32 @@ struct IcBox
 	char buffer[BUFFER_SIZE];
 	int bufferPos;
 	Queue* queue;
-	int testing;
 };
 
-static int _IcBox_echoTest(IcBox * lib, CommPort* comm);
+static int _IcBox_echoTest(IcBox * lib);
+
+static void _IcBox_disconnect(IcBox * lib)
+{
+#ifdef DEBUGLIB
+	printf("Disconnecting device\n");
+#endif
+	lib->abandoned = 1;
+	Mutex_lock(lib->writeMutex);
+	if(lib->comm != NULL)
+		CommPort_cancel(lib->comm);
+	Mutex_unlock(lib->writeMutex);
+	Thread_join(lib->thReceive);
+	Mutex_lock(lib->writeMutex);
+	if(lib->comm != NULL)
+		CommPort_free(lib->comm);
+	lib->comm = NULL;
+	Mutex_unlock(lib->writeMutex);
+	lib->abandoned = 0;
+	lib->connected = 0;
+#ifdef DEBUGLIB
+	printf("Device disconnected\n");
+#endif
+}
 
 static void _IcBox_pushEvent(IcBox * lib, int eventType, const char * data, int bytes)
 {
@@ -55,248 +85,268 @@ static void _IcBox_pushEvent(IcBox * lib, int eventType, const char * data, int 
 	Mutex_unlock(lib->writeMutex);
 }
 
-static void _IcBox_reconnect(IcBox * lib)
+static void _IcBox_cancel(IcBox * lib)
 {
 #ifdef DEBUGLIB
-	printf("disconnecting\n");
+	printf("Canceling connection\n");
 #endif
-	CommPort_free(lib->comm);
-#ifdef DEBUGLIB
-	printf("comm port freed\n");
-#endif
-	lib->comm = NULL;
+	_IcBox_disconnect(lib);
+	if(lib->canceled)
+		Event_post(lib->evCancel);
 	_IcBox_pushEvent(lib, ICBOX_EVENT_DISCONNECTED, NULL, 0);
 #ifdef DEBUGLIB
-	printf("sent disconnect event\n");
+	printf("Connection canceled\n");
 #endif
-	lib->canceled = 1;
+}
+
+static void _IcBox_reconnect(IcBox * lib)
+{
+	_IcBox_cancel(lib);
 	Thread_start(lib->thConnect); // try connect again
 }
 
-static int _IcBox_proccessResponse(IcBox * lib, const char * response)
+static int _IcBox_execute(IcBox * lib, const unsigned char * buffer, int size)
 {
-	if(strcmp("F", response) == 0 || strcmp("I", response) == 0 || strcmp("A", response) == 0 || strcmp("D", response) == 0)
-    {
-		return 1;
+    if (size < 3) {
+        return 0;
     }
-	else if(strcmp("RING", response) == 0)
-	{
-		if(!lib->testing)
-			_IcBox_pushEvent(lib, ICBOX_EVENT_RING, NULL, 0);
-		return 1;
-	}
-	else if(strncmp("          ", response, 4) == 0)
-	{
-		int offset = 10;
-		if(!lib->testing)
-			_IcBox_pushEvent(lib, ICBOX_EVENT_CALLERID, response + offset, 12);
-		return 1;
-	}
-	else if(strcmp("NO CARRIER", response) == 0)
-	{
-		if(!lib->testing)
-			_IcBox_pushEvent(lib, ICBOX_EVENT_HANGUP, NULL, 0);
-		return 1;
-	}
+    if (buffer[0] == 'F' || buffer[0] == 'I' || buffer[0] == 'A' ||
+        buffer[0] == 'D' || buffer[0] == 'O')
+    {
+        if (buffer[1] == '\r' && buffer[2] == '\n')
+        {
+            Event_post(lib->evDetected);
+            return 3;
+        }
+        return 0;
+    }
+    if (size < 47) {
+        return 0;
+    }
+    if (buffer[0] == ' ' && buffer[9] == ' ' && buffer[45] == '\r'
+        && buffer[46] == '\n')
+    {
+        Event_post(lib->evDetected);
+        if (!lib->testing && buffer[22] == 'E')
+        {
+            Event_reset(lib->evDetected);
+            if (buffer[38] == 'I')
+            {
+                _IcBox_pushEvent(lib, ICBOX_EVENT_CALLERID, 
+                    (const char*)buffer + 10, 12);
+            }
+            else if (buffer[38] == 'D')
+            {
+                _IcBox_pushEvent(lib, ICBOX_EVENT_HANGUP, NULL, 0);
+            }
+            else if (buffer[38] == 'A')
+            {
+                _IcBox_pushEvent(lib, ICBOX_EVENT_OFFHOOK, NULL, 0);
+            }
+        }
+        return 47;
+    }
 	return 0;
 }
 
 static int _IcBox_dataReceived(IcBox * lib, const unsigned char * buffer, 
 	int size)
 {
-	int count = 0, i, prev_pos, bytesToRead;
-	
-	while(size > 0)
-	{
-		bytesToRead = size < (BUFFER_SIZE - lib->bufferPos)? size: (BUFFER_SIZE - lib->bufferPos);
-		if(!bytesToRead) 
-		{
-			// insuficient buffer, clear it!
+	int consummed = 0;
+	int min_response, max_response, offset;
 #ifdef DEBUGLIB
-			printf("insuficient buffer, need %d, have %d, cleaning!\n", size, (BUFFER_SIZE - lib->bufferPos));
+	printf("Data received (%d byte): %s\n", size, buffer);
 #endif
-			lib->bufferPos = 0;
-			lib->buffer[lib->bufferPos] = '\0';
-			break;
-		}
-		memcpy(lib->buffer + lib->bufferPos, buffer, bytesToRead);
-		size -= bytesToRead;
-		prev_pos = lib->bufferPos;
-		lib->bufferPos += bytesToRead;
-		lib->buffer[lib->bufferPos] = '\0';
-		// find carriage return
-		i = prev_pos;
-		while(i < lib->bufferPos)
-		{
-			if(lib->buffer[i] == 13 || lib->buffer[i] == 10) {
-				lib->buffer[i] = '\0';
-				if(lib->buffer[0] != '\0')
-				{
-					if(_IcBox_proccessResponse(lib, lib->buffer))
-						count++;
-				}
-				if(lib->buffer[i] == 10)
-					i++; // skip LF
-				i++; // skip CR
-				// copy remaining command and find again
-				memcpy(lib->buffer, lib->buffer + i, lib->bufferPos - i);
-				lib->bufferPos = lib->bufferPos - i;
-				lib->buffer[lib->bufferPos] = '\0';
-				i = 0;
-				continue;
-			}
-			i++;
-		}
+	min_response = 3;
+    max_response = 47;
+	
+    offset = 0;
+    while((size - offset) >= min_response)
+    {
+        consummed = _IcBox_execute(lib, buffer + offset, size - offset);
+        if(consummed)
+            break;
+        offset++;
+    }
+    consummed += offset;
+	if(consummed == 0 && size > max_response)
+		consummed = size - max_response + 1; // já verificou esses bytes
+	return consummed;
+}
+
+static void _IcBox_aliveTest(void* data)
+{
+	IcBox * lib = (IcBox*)data;
+	if(!_IcBox_echoTest(lib))
+	{
+		if (lib->canceled)
+			return;
+		_IcBox_reconnect(lib);// try connect again
 	}
-	return count;
+#ifdef DEBUGLIB
+	else 
+	{
+		printf("Device alive\n");
+	}
+#endif
 }
 
 static void _IcBox_receiveFunc(void* data)
 {
 	IcBox * lib = (IcBox*)data;
-	int bytesAvailable;
-	Mutex_lock(lib->mutex);
-	while(lib->canceled == 0)
+	unsigned char buffer[BUFFER_SIZE];
+	unsigned char window[BUFFER_SIZE + 1];
+	int window_size = 0;
+	int buffer_size;
+	int remaining, consumed, unused, used;
+
+	while(!lib->canceled && !lib->abandoned)
 	{
 #ifdef DEBUGLIB
-	printf("waiting for receive event\n");
+	printf("Waiting for receive event\n");
 #endif
-		if(CommPort_waitEx(lib->comm, &bytesAvailable, lib->requestAliveInterval))
-		{
+		buffer_size = CommPort_readEx(lib->comm, buffer, BUFFER_SIZE, lib->requestAliveInterval);
 #ifdef DEBUGLIB
-			printf("%d bytes available\n", bytesAvailable);
+		printf("Bytes received: %d\n", buffer_size);
 #endif
-			if(bytesAvailable == 0)
-				continue;
-			unsigned char * buffer = (unsigned char *)malloc(
-				sizeof(unsigned char) * (bytesAvailable + 1));
-			bytesAvailable = CommPort_read(lib->comm, buffer, bytesAvailable);
-			buffer[bytesAvailable] = 0;
-			_IcBox_dataReceived(lib, buffer, bytesAvailable);
-			free(buffer);
+		buffer_size = buffer_size < BUFFER_SIZE?buffer_size:BUFFER_SIZE;
+		if(lib->canceled || lib->abandoned)
+			continue;
+		if(buffer_size == 0 && !lib->testing)
+		{
+			Thread_start(lib->thAlive);
 			continue;
 		}
-		if(lib->canceled == 1)
+		if(buffer_size == 0)
 			continue;
-		else
-		{
-			if(!_IcBox_echoTest(lib, lib->comm))
-			{
-				if(lib->canceled == 1)
-					continue;
-				_IcBox_reconnect(lib);// try connect again
-			} 
-			else 
-			{
 #ifdef DEBUGLIB
-				printf("device alive\n");
+		printf("Bytes read: %d\n", buffer_size);
 #endif
+		remaining = buffer_size;
+		consumed = 0;
+		while(remaining > 0 || consumed > 0)
+		{
+			unused = BUFFER_SIZE - window_size;
+			consumed = remaining < unused?remaining:unused;
+			if(consumed == 0 && remaining > 0)
+				consumed++; // consome pelo menos 1 byte
+			used = buffer_size - remaining;
+			remaining -= consumed;
+			if(consumed > unused)
+			{
+				memmove(window, window + consumed, BUFFER_SIZE - consumed);
+				window_size -= consumed;
 			}
+			memcpy(window + window_size, buffer + used, consumed);
+			window_size += consumed;
+#ifdef DEBUGLIB
+			window[window_size] = 0; // permite mostrar como texto
+#endif
+			consumed = _IcBox_dataReceived(lib, window, window_size);
+			window_size -= consumed;
+			if(window_size > 0)
+				memmove(window, window + consumed, BUFFER_SIZE - consumed);
+			if(consumed > 0 && window_size == 0)
+				consumed = 0;
 		}
 	}
-	Mutex_unlock(lib->mutex);
-#ifdef DEBUGLIB
-	printf("leave _IcBox_receiveFunc\n");
-#endif
 }
 
-static int _IcBox_sendCmd(IcBox * lib, CommPort* comm, const char * buffer)
+static int _IcBox_sendCmd(IcBox * lib, const char * buffer)
 {
-	int size, bytesAvailable, bwritten;
+	int size, bwritten;
 
 	size = strlen(buffer);
 #ifdef DEBUGLIB
-	printf("sending active check command...\n");
+	printf("Sending active check command...\n");
 #endif
 	Mutex_lock(lib->writeMutex);
-	bwritten = CommPort_writeEx(comm, (unsigned char*)buffer, size, lib->connectTimeout / 2);
+	bwritten = CommPort_writeEx(lib->comm, (unsigned char*)buffer, size,
+        lib->connectTimeout / 2);
 	Mutex_unlock(lib->writeMutex);
-	if(bwritten != size)
-	{
-#ifdef DEBUGLIB
-		printf("Error sending command\n");
-#endif
-		return 0;
-	}
-	if(!CommPort_waitEx(comm, &bytesAvailable, lib->connectTimeout * 10))
-	{
-#ifdef DEBUGLIB
-		printf("Waiting response timeout\n");
-#endif
-		return 0;
-	}
-	if(bytesAvailable <= 0)
-	{
-#ifdef DEBUGLIB
-		printf("No response data\n");
-#endif
-		return 0;
-	}
-	unsigned char * buff = (unsigned char *)malloc(
-			sizeof(unsigned char) * (bytesAvailable + 1));
-	bytesAvailable = CommPort_readEx(comm, buff, bytesAvailable, lib->connectTimeout / 2);
-	if(bytesAvailable <= 0)
-	{
-		free(buff);
-#ifdef DEBUGLIB
-		printf("Read response data failed\n");
-#endif
-		return 0;
-	}
-	buff[bytesAvailable] = 0;
-	lib->testing = 1;
-	if(_IcBox_dataReceived(lib, buff, bytesAvailable))
-	{
-		free(buff);
-		lib->testing = 0;
-		return 1;
-	}
-	lib->testing = 0;
-	free(buff);
-#ifdef DEBUGLIB
-	printf("No compatible device or invalid command\n");
-#endif
-	return 0;
+	return bwritten == size;
 }
 
-static int _IcBox_echoTest(IcBox * lib, CommPort* comm)
+static int _IcBox_echoTest(IcBox * lib)
 {
+	int old_testing = lib->testing;
 #ifdef DEBUGLIB
 	printf("Echo test started\n");
 #endif
-	return _IcBox_sendCmd(lib, comm, "@CX\r\n");
+	lib->testing = 1;
+	_IcBox_sendCmd(lib, "@CX\r\n");
+    Event* object = Event_waitMultipleEx(&lib->evDetected, 1, lib->connectTimeout);
+	lib->testing = old_testing;
+    if(object != lib->evDetected)
+        return 0;
+	return 1;
 }
 
 static void _IcBox_connectFunc(void* data)
 {
 	IcBox * lib = (IcBox*)data;
 	CommPort* comm;
-	int i, need, count, len;
+	int i, need, count, len, tried;
 	char * ports, * port;
 #ifdef DEBUGLIB
-	printf("enter _IcBox_connectFunc\n");
+	printf("Starting connection\n");
 #endif
-	Mutex_lock(lib->mutex);
-	lib->canceled = 0;
-	Mutex_unlock(lib->mutex);
-	count = 0;
-	need = CommPort_enum(NULL, 0);
-	if(lib->port[0] != 0)
-		len = strlen(lib->port) + 1;
-	else
-		len = 0;
-	ports = (char*)malloc(need + len + 1);
-	if(len > 0)
+	if(lib->canceled || lib->abandoned) 
 	{
-		memcpy(ports, lib->port, len);
-		ports[len] = 0;
-		count++;
-	}
-	count += CommPort_enum(ports + len, need);
 #ifdef DEBUGLIB
-	printf("searching port... %d found\n", count);
+        printf("Connection aborted\n");
 #endif
-	while(lib->canceled == 0)
+		return;
+	}
+	i = 0;
+	count = 0;
+	need = 4096;
+	do
+	{
+		if(lib->port[0] != 0)
+			len = strlen(lib->port) + 1;
+		else
+			len = 0;
+		ports = (char*)malloc(need + len + 1);
+		if(len > 0)
+		{
+			memcpy(ports, lib->port, len);
+			ports[len] = 0;
+			count++;
+		}
+		int port_count = CommPort_enum(ports + len, need);
+		if(port_count == 0)
+		{
+#ifdef DEBUGLIB
+            printf("Error on enum ports\n");
+#endif
+			break;
+		}
+		if(port_count < 0)
+		{
+			if(i > 1)
+			{
+#ifdef DEBUGLIB
+                printf("Error trying to enum ports again, stoped!\n");
+#endif
+				break;
+			}
+#ifdef DEBUGLIB
+            printf("Enum ports, need more %d byte of memory\n", -port_count);
+#endif
+			need = -port_count;
+			i++;
+			free(ports);
+			continue;	
+		}
+		count += port_count;
+		break;
+	} while(1);
+#ifdef DEBUGLIB
+	printf("Searching port... %d found\n", count);
+#endif
+	tried = 1;
+	while(!lib->canceled && !lib->abandoned)
 	{
 		// try connect to one port
 		comm = NULL;
@@ -304,48 +354,51 @@ static void _IcBox_connectFunc(void* data)
 		for(i = 1; i <= count; i++)
 		{
 #ifdef DEBUGLIB
-			printf("trying connect to %s\n", port);
+			printf("Trying connect to %s baund %d\n", port, lib->commSettings.baund);
 #endif
-			comm = CommPort_create(port);
+			comm = CommPort_createEx(port, &lib->commSettings);
 			if(comm != NULL)
 			{
-				if(_IcBox_echoTest(lib, comm))
+				// connection successful, start receive event
+				lib->comm = comm;
+				Thread_start(lib->thReceive);
+				if(_IcBox_echoTest(lib))
 					break;
-				CommPort_free(comm);
+				_IcBox_disconnect(lib);
 				comm = NULL;
 			}
-			if(lib->canceled == 1)
+			if(lib->canceled || lib->abandoned)
 				break;
 			port += strlen(port) + 1;
 		}
 		if(comm != NULL)
 		{
 #ifdef DEBUGLIB
-			printf("%s connected\n", port);
+			printf("Device connected using %s\n", port);
 #endif
-			// connection successful, start receive event
-			lib->comm = comm;
+			lib->connected = 1;
 			strcpy(lib->port, port);
 			_IcBox_pushEvent(lib, ICBOX_EVENT_CONNECTED, NULL, 0);
-#ifdef DEBUGLIB
-			// printf("Enabling Caller ID\n");
-#endif
-			// int enabled = 0;
-			// enabled = enabled || _IcBox_sendCmd(lib, comm, "AT+VCID=1\r\n");
-			// enabled = enabled || _IcBox_sendCmd(lib, comm, "AT#CID=1\r\n");
-			// enabled = enabled || _IcBox_sendCmd(lib, comm, "AT#CC1\r\n");
-			// enabled = enabled || _IcBox_sendCmd(lib, comm, "AT%CCID=1\r\n");
-			// enabled = enabled || _IcBox_sendCmd(lib, comm, "AT*ID1\r\n");
-			Thread_start(lib->thReceive);
 			break;
 		}
 #ifdef DEBUGLIB
-		printf("no port available, trying again\n");
+		printf("No port available, trying again\n");
 #endif
-		if(lib->canceled == 1)
+		if(lib->canceled || lib->abandoned)
 			break;
 		// not port available, wait few seconds and try again
-		Event_waitEx(lib->evCancel, lib->retryTimeout);
+		Thread_wait(lib->retryTimeout);
+		lib->baundIndex = (lib->baundIndex + 1) % (sizeof(baundValues) / sizeof(int));
+		if(tried < 3 && baundValues[lib->baundIndex] > REPEAT_BAUND)
+		{
+			lib->baundIndex = 0;
+			tried++;
+		}
+		else if(tried >= 3 && lib->baundIndex == 0)
+		{
+			tried = 1;
+		}
+		lib->commSettings.baund = baundValues[lib->baundIndex];
 	}
 	free(ports);
 #ifdef DEBUGLIB
@@ -385,14 +438,20 @@ LIBEXPORT IcBox * LIBCALL IcBox_create(const char* config)
 	lib->queue = Queue_create();
 	lib->mutex = Mutex_create();
 	lib->writeMutex = Mutex_create();
+	lib->connected = 0;
+	lib->testing = 0;
+	lib->abandoned = 0;
 	lib->canceled = 0;
+	lib->baundIndex = 0;
 	lib->evCancel = Event_create();
+	lib->evDetected = Event_createEx(0, 0);
 	lib->evReceive = Event_createEx(0, 0);
 	lib->thReceive = Thread_create(_IcBox_receiveFunc, lib);
 	lib->thConnect = Thread_create(_IcBox_connectFunc, lib);
+	lib->thAlive = Thread_create(_IcBox_aliveTest, lib);
 	lib->comm = NULL;
 	lib->port[0] = 0;
-	lib->commSettings.baund = 9600;
+	lib->commSettings.baund = baundValues[lib->baundIndex];
 	lib->commSettings.data = 8;
 	lib->commSettings.stop = StopBits_One;
 	lib->commSettings.parity = Parity_None;
@@ -492,26 +551,13 @@ LIBEXPORT void LIBCALL IcBox_setConfiguration(IcBox * lib, const char * config)
 			lib->requestAliveInterval = tm;
 	}
 	free(lwconfig);
-	if(IcBox_isConnected(lib))
-	{
-		if(portChanged)
-		{
-			lib->canceled = 1;
-			CommPort_cancel(lib->comm);
-			Thread_join(lib->thReceive);
-			_IcBox_reconnect(lib);// try connect again
-		} 
-		else if(commSettingsChanged) 
-		{
-			if(!CommPort_configure(lib->comm, &lib->commSettings))
-			{
-				lib->canceled = 1;
-				CommPort_cancel(lib->comm);
-				Thread_join(lib->thReceive);
-				_IcBox_reconnect(lib);// try connect again
-			}
-		}
-	}
+	if(lib->comm == NULL)
+		return;
+	if(!portChanged && !commSettingsChanged)
+		return;
+	if(commSettingsChanged) 
+		CommPort_configure(lib->comm, &lib->commSettings);
+	_IcBox_reconnect(lib);
 }
 
 LIBEXPORT const char* LIBCALL IcBox_getConfiguration(IcBox * lib)
@@ -579,7 +625,7 @@ LIBEXPORT int LIBCALL IcBox_pollEvent(IcBox * lib, IcBoxEvent* event)
 		printf("IcBox_pollEvent[Queue not empty %d items]\n", Queue_count(lib->queue));
 #endif
 	}
-	if(object == lib->evCancel || lib->canceled == 1)
+	if(object == lib->evCancel || lib->canceled)
 		return 0;
 	Mutex_lock(lib->writeMutex);
 	IcBoxEvent* qEvent = (IcBoxEvent*)Queue_pop(lib->queue);
@@ -592,26 +638,24 @@ LIBEXPORT int LIBCALL IcBox_pollEvent(IcBox * lib, IcBoxEvent* event)
 
 LIBEXPORT void LIBCALL IcBox_cancel(IcBox * lib)
 {
-	Mutex_lock(lib->writeMutex);
+	if(lib->canceled)
+		return;
 	lib->canceled = 1;
-	if(lib->comm != NULL)
-		CommPort_cancel(lib->comm);
-	Event_post(lib->evCancel);
-	Mutex_unlock(lib->writeMutex);
+	_IcBox_cancel(lib);
 }
 
 LIBEXPORT void LIBCALL IcBox_free(IcBox * lib)
 {
 	IcBox_cancel(lib);
-	Event_post(lib->evReceive);
+	Thread_join(lib->thAlive);
 	Thread_join(lib->thReceive);
 	Thread_join(lib->thConnect);
+	Thread_free(lib->thAlive);
 	Thread_free(lib->thReceive);
 	Thread_free(lib->thConnect);
 	Event_free(lib->evCancel);
 	Event_free(lib->evReceive);
-	if(lib->comm != NULL)
-		CommPort_free(lib->comm);
+	Event_free(lib->evDetected);
 	StringBuilder_free(lib->config);
 	Mutex_lock(lib->writeMutex);
 	while(!Queue_empty(lib->queue))
