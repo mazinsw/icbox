@@ -1,0 +1,11 @@
+{
+    "files.associations": {
+        "*.h": "c",
+    },
+    "[c]": {
+        "files.encoding": "windows1252"
+    },
+    "[cpp]": {
+        "files.encoding": "windows1252"
+    }
+}

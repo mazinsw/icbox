@@ -1,0 +1,32 @@
+language: node_js
+
+services:
+  - docker
+
+before_install:
+  - docker pull mazinsw/mingw-w64:4.0.4
+
+script:
+  - docker run -ti -v `pwd`:/mnt -u $(id -u ${USER}):$(id -g ${USER}) mazinsw/mingw-w64:4.0.4 /bin/sh -c '
+      cd /mnt &&
+      make clean shared64 &&
+      make clean shared32 &&
+      make clean static64 &&
+      make clean static32'
+
+before_deploy:
+  - cd build
+  - zip -qr IcBox.zip x64 x86
+  - cd ..
+
+deploy:
+  provider: releases
+  api_key:
+    secure: p7dLXR+XuhRRd0BrEgRWqC7qDEWzaTuLOiqSlTnzz7jTYwEi9bPyhlIgGuZ+/bFgcA0o60WIFL/15V6M1t1xA/42Ju4cevZMPokr1gGAOwAclKI2GwUy3x5/VcDn7k0SQX+7CBliXPDfbS0CfwP0D30KiZbXCr22cOu9SynnxAjEZwviUr12Ku5aGg2r0HgjwfZLZBkPBXCygtPkxI38slI+IW3ZGEto1hRW7nh+1mWJviuGsagB3bicPEZcOKestY21eBEtrc/LOKqpKO1sLu6sVnFZmIUGJ4cUkvvtI7k4au0I7jjQr35R//SKZIU/F816iyU8AUHwaE4fAR7ntZuscbL6x2lPrwOcgicBiKTjPqHCtTbWuBH2WQJCBTzp2JsNPHSsKhkH2Mf+exyVpAzXofD0vGq+waKSBrdZvg5RWGDsKNeti/7EQxQzmvthWOV3N3aQXuoA95V5dQcsMtq1ZmhYCLbUUbM3nBacrCtjBaBR8rodZZn9us4bkQxpUQ+fIjsMMTP1KscAOJ49YaFV5sIkkINSIKFocFB+eb6RjXpYBZZSUNSlpxPQBG+kakjVtlAHxl2TzpK2n9rqlOe32bYhguhsFn4LgIOIP/EssJY/xANcB8Rb9qvcMPTw/3hBk+2wkKRdE5nqpMDtry9YnpqFss3gB/U+/2cCO9M=
+
+  file: build/IcBox.zip
+  skip_cleanup: true
+
+  on:
+    tags: true
+    repo: mazinsw/icbox

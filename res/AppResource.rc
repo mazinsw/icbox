@@ -1,6 +1,6 @@
 1 VERSIONINFO
-    FILEVERSION 1, 0, 0, 0
-    PRODUCTVERSION 1, 0, 0, 0
+    FILEVERSION 1, 1, 0, 0
+    PRODUCTVERSION 1, 1, 0, 0
     FILEOS 0x4L
     FILETYPE 0x1L
 BEGIN
@@ -8,14 +8,14 @@ BEGIN
     BEGIN
         BLOCK "041604E4"
         BEGIN
-            VALUE "CompanyName", "MZ Software"
+            VALUE "CompanyName", "GrandChef"
             VALUE "FileDescription", "IcBox CallerID Detection"
-            VALUE "FileVersion", "1.0.0.0"
+            VALUE "FileVersion", "1.1.0.0"
             VALUE "InternalName", "IcBox.dll"
             VALUE "LegalCopyright", ""
             VALUE "OriginalFilename", "IcBox.dll"
             VALUE "ProductName", "IcBox"
-            VALUE "ProductVersion", "1.0.0.0"
+            VALUE "ProductVersion", "1.1.0.0"
         END
     END
     BLOCK "VarFileInfo"
